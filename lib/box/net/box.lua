@@ -160,6 +160,7 @@ function box.net.box:request(pktt,body)
 	self.wchan:put(req)
 	-- todo: timeout
 	local res = self.req[sync]:get()
+	self.req[sync] = nil
 	---- print("received ",res)
 	if res then
 		local op,body = unpack(res)
