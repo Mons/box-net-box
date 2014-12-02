@@ -1,4 +1,5 @@
 require "box.net"
+--require "utils"
 local object = require 'box.oop'
 
 
@@ -94,7 +95,7 @@ box.net.box = box.net:inherits({
 
 setmetatable(box.net.self, {
 	__index = box.net.box,
-	__tostring = function(self) return 'box.net.self()' end,
+	--__tostring = function(self) return 'box.net.self()' end,
 })
 
 local seq = 0
@@ -113,7 +114,21 @@ end
 
 function box.net.box:reader()
 	while self.s do
-		local res = { self.s:recv(12) }
+		--print("reader self ", self, " and s.", self.s)
+		local res = { pcall(self.s.recv, self.s, 12) }
+		--local res = { pcall(self.s.recv, self.s, 12) }
+		--for _,x in pairs(res) do print(_," ", x) end
+		--print("res :: " .. dumper(res))
+		if res[1]  then
+			table.remove(res,1)
+		else
+			print("on reader: recv socket: " , res[2])
+			return
+		end
+		--print("res after :: " .. dumper(res))
+		--box.fiber.sleep(3)
+		--local res = { self.s:recv(12, self._timeout) }
+		--local res = { self.s:recv(12) }
 		if res[4] ~= nil then
 			self:fatal("Can't read from %s: %s", self.s, res[3])
 			return

@@ -8,7 +8,7 @@ local log = require "box.log"
 -- local fiber  = box.fiber
 
 -- local base = _G
---log.modlevel(log.DEBUG)
+-- log.modlevel(log.DEBUG)
 -- module("box.net", package.seeall)
 
 ---- test
@@ -31,6 +31,27 @@ function box.net:init( host, port, timeout )
 	self.state = 'auto'
 	-- states: init, connecting, connected, reconnecting [, resolve ]
 	log.debug("boxinit: %s:%s/%f",self.host,self.port,self._timeout)
+	box.reloader:register(self)
+end
+
+function box.net:destroy()
+	log.info("destroy box.net.box: ", self)
+	box.net.close(self)
+	if self.wrfib then
+		if box.fiber.status(self.wrfib) ~= 'dead' then
+			log.info("Cancel wr:",box.fiber.id(self.wrfib))
+			box.fiber.cancel(self.wrfib)
+		end
+	end
+	if self.rw then
+		if box.fiber.status(self.rw) ~= 'dead' then
+			local fib = box.fiber.id(self.rw)
+			box.info("Cancel rw:",fib)
+			box.fiber.cancel(self.rw)
+		end
+	end
+	self = nil
+	collectgarbage()
 end
 
 function box.net:fdno()
@@ -75,7 +96,6 @@ end
 
 function box.net.writer(self)
 	box.fiber.name("writer."..tostring(self))
-	---- print("writer...")
 	while self.s do
 		-- print("wait for write data")
 		local wbuf = self.wchan:get()
@@ -94,7 +114,6 @@ end
 
 function box.net.connreader(self)
 	box.fiber.name("rw-cn." .. self:desc())
-	---- print("connfiber")
 	while true do
 		while true do
 			--- printf("connecting to %s:%s", self.host,self.port)
@@ -132,8 +151,9 @@ function box.net.connreader(self)
 		
 		self.wchan  = box.ipc.channel(1)
 		self.wrfib  = box.fiber.wrap(self.writer,self)
-		
+		box.fiber.testcancel()
 		self:reader()
+		box.fiber.testcancel()
 		
 		print("reader left")
 	end
