@@ -189,6 +189,13 @@ function box.net.box:request(pktt,body)
 	end
 end
 
+function box.net.box:doping()
+	return self:call(
+		'box.dostring',
+		'return true'
+	)
+end
+
 function box.net.box:ping()
 	-- if self.state ~= 'connected' and self.state ~= 'auto' then return false end
 	return self:request(65280,'')
