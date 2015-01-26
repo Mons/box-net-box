@@ -1,226 +1,129 @@
-require "box.net"
---require "utils"
-local object = require 'box.oop'
+local net = require 'box.net'
 
+local M = net:inherits({ __name = 'box.net.box' })
+box.net.box = M
 
---local string = require "string"
---local debug  = require "debug"
+require 'box.net.self'
 
---local base = _G
-
--- module("box.net.box")
-
---local print    = base.print
---local tonumber = base.tonumber
---local tostring = base.tostring
---local error    = base.error
-
-box.net.self = {
-	__name = 'box.net.self',
-	
-	process = function(self, ...)
-		return box.process(...)
-	end,
-	
-	request = function(self,...)
-		return box.process(...)
-	end,
-	
-	select_range = function(self, sno, ino, limit, ...)
-		return box.space[tonumber(sno)].index[tonumber(ino)]
-			:select_range(tonumber(limit), ...)
-	end,
-	
-	select_reverse_range = function(self, sno, ino, limit, ...)
-		return box.space[tonumber(sno)].index[tonumber(ino)]
-			:select_reverse_range(tonumber(limit), ...)
-	end,
-	
-	call = function(self, proc_name, ...)
-		--[[
-			return                        ()
-			return 123                    tuple({123})
-			return {123}                  tuple({123})
-			return {123,456}              tuple({123,456})
-			
-			return {{123}}                (tuple({123}))                   reduced to {123}
-			
-			return 123,456                tuple({123}),tuple({456})
-			return {{123},{456}}          (tuple({123}), tuple({456}))     reduced to {123},{456}
-		]]--
-		local proc = box.call_loadproc(proc_name)
-		local rv = { proc(...) }
-		if #rv == 0 then return end
-		if type(rv[1]) == 'table' and #rv[1] > 0 and type(rv[1][1]) == 'table' then
-			rv = rv[1]
-		end
-		for k,v in pairs(rv) do
-			if type(v) ~= 'userdata' then
-				rv[k] = box.tuple.new( v )
-			end
-		end
-		return unpack(rv)
-	end,
-	
-	ecall = function(self, proc_name, ...)
-		local proc = box.call_loadproc(proc_name)
-		local rv = { proc(...) }
-		
-		if #rv == 0 then return end
-		if type(rv[1]) == 'table' and #rv[1] > 0 and type(rv[1][1]) == 'table' then
-			rv = rv[1]
-		end
-		if type(rv[1]) ~= 'userdata' then
-			rv[1] = box.tuple.new( rv[1] ):totable()
-		end
-		return unpack(rv[1])
-	end,
-	
-	ping = function(self)
-		return true
-	end,
-	
-	timeout = function(self, timeout)
-		return self
-	end,
-	
-	close = function(self)
-		return true
-	end
+local C2R = {
+	[65280] = 'ping',
+	[13]    = 'insert',
+	[17]    = 'select',
+	[19]    = 'update',
+	[21]    = 'delete',
+	[22]    = 'call',
 }
 
-box.net.box = box.net:inherits({
-	__name = 'box.net.box'
-})
-
-setmetatable(box.net.self, {
-	__index = box.net.box,
-	--__tostring = function(self) return 'box.net.self()' end,
-})
-
 local seq = 0
-function box.net.box.seq()
-	seq = seq + 1
-	if seq < 0xffffffff then
-	else
-		seq = 1
-	end
+function M.seq()
+	seq = seq < 0xffffffff and seq + 1 or 1
 	return seq
 end
 
-function box.net.box:on_connected()
-	self.req = {}
+function M:init(...)
+	getmetatable( self.__index ).__index.init( self,... )
+	self.req = setmetatable({},{__mode = "kv"})
 end
 
-function box.net.box:reader()
-	while self.s do
-		--print("reader self ", self, " and s.", self.s)
-		local res = { pcall(self.s.recv, self.s, 12) }
-		--local res = { pcall(self.s.recv, self.s, 12) }
-		--for _,x in pairs(res) do print(_," ", x) end
-		--print("res :: " .. dumper(res))
-		if res[1]  then
-			table.remove(res,1)
-		else
-			print("on reader: recv socket: " , res[2])
-			return
+function M:_cleanup(e)
+	getmetatable( self.__index ).__index._cleanup( self,e )
+	for k,v in pairs(self.req) do
+		if type(v) ~= 'number' then
+			v:put(false)
 		end
-		--print("res after :: " .. dumper(res))
-		--box.fiber.sleep(3)
-		--local res = { self.s:recv(12, self._timeout) }
-		--local res = { self.s:recv(12) }
-		if res[4] ~= nil then
-			self:fatal("Can't read from %s: %s", self.s, res[3])
-			return
-		end
-		local header = res[1]
-		if string.len(header) ~= 12 then
-			self:fatal("Short read from %s: %s", self.s, res[3] or res[2])
-			return
-		end
-		local op, blen, sync = box.unpack('iii', header)
-		--- print("got header ", op,' ', blen, ' ', sync)
-		local body
-		if blen > 0 then
-			res = { self.s:recv(blen) }
-			if res[4] ~= nil then
-				self:fatal("Can't read from %s: %s", self.s, res[3])
-				return
-			end
-			body = res[1]
-			if string.len(body) ~= blen then
-				self:fatal("Short read from %s: %s", self.s, res[3] or res[2])
-				return
-			end
-		end
-		if self.req[sync] ~= nil then
-			self.req[sync]:put({ op,body })
-		else
-			printf("Unexpected packet %s:%s from %s",op,sync,self.s)
-		end
+		self.req[k] = nil
 	end
 end
 
-function box.net.box:request(pktt,body)
-	if self.state == 'auto' then
-		self.state = 'init'
-		local connected = self:connect(false)
-		if not connected then return false end
+function M:on_read(is_last)
+	-- print("<<", self.rbuf:xd())
+	local oft = 0
+	while #self.rbuf >= oft + 12 do
+		local pktt,len,seq = box.unpack('iii',string.sub(self.rbuf, oft+1,oft+12 ))
+		--print("packet ",pktt," ",len," ",seq)
+		if #self.rbuf >= oft + 12 + len then
+			local body = string.sub( self.rbuf,oft + 12 + 1,oft + 12 + len )
+			--print("body = '",body:xd(),"'")
+			
+			if self.req[ seq ] then
+				if type(self.req[ seq ]) ~= 'number' then
+					--print("Have requestor for ",seq)
+					self.req[ seq ]:put( body )
+					self.req[ seq ] = nil
+				else
+					print("Received timed out ",C2R[ pktt ], "#",seq," after ",string.format( "%0.4fs", box.time() - self.req[ seq ] ))
+					self.req[ seq ] = nil
+				end
+			else
+				print("Got no requestor for ",seq)
+			end
+			-- ...
+			
+			oft = oft + 12 + len
+		else
+			break
+		end
 	end
-	if self.state ~= 'connected' then return false end
-	local sync = self:seq()
-	local req  = box.pack('iiia', pktt, string.len(body), sync, body)
-	--- printf("state: %s: sending %d bytes...", self.state, #req)
-	self.req[sync] = box.ipc.channel(1)
-	self.wchan:put(req)
-	-- todo: timeout
-	local res = self.req[sync]:get()
-	self.req[sync] = nil
-	---- print("received ",res)
-	if res then
-		local op,body = unpack(res)
-		if op ~= pktt then error("Packet type mismatch") end
-		if op == 65280 then return true end
-		local code,resp = box.unpack('ia',body)
-		if code ~= 0 then box.raise(code, resp) end
-		return box.unpack('R',resp)
+	if oft > 0 then
+		if oft < #self.rbuf then
+			self.rbuf = string.sub( self.rbuf,oft+1 )
+		else
+			self.rbuf = ''
+		end
+	end
+	return
+end
+
+function M:request(pktt,body)
+	local seq = self.seq()
+	local req = box.pack('iiia', pktt, #body, seq, body)
+	-- print("request ",C2R[pktt] or pktt, "#", seq)
+	self:write(req)
+	local ch = box.ipc.channel(1)
+	self.req[ seq ] = ch
+	local now = box.time()
+	local body = ch:get( self.timeout ) -- timeout?
+	--print("got body = ",body, " ",self.lasterror)
+	if body then
+		if #body > 0 then
+			local code,resp = box.unpack('ia',body)
+			if code ~= 0 then
+				box.raise(code, resp)
+			end
+			return box.unpack('R',resp)
+		else
+			return ''
+		end
+	elseif body == false then
+		self.req[ seq ] = nil
+		print("Request ",C2R[ pktt ], "#",seq," error: "..self.lasterror.." after ",string.format( "%0.4fs", box.time() - now ))
+		box.raise( box.error.ER_PROC_LUA, "Request "..C2R[ pktt ].."#"..seq.." error: "..self.lasterror )
 	else
-		error("Not received res")
+		self.req[ seq ] = now
+		print("Request ",C2R[ pktt ], "#",seq," timed out after ",string.format( "%0.4fs", box.time() - now ))
+		box.raise( box.error.ER_PROC_LUA, "Request "..C2R[ pktt ].."#"..seq.." timed out" )
 	end
 end
 
-function box.net.box:doping()
-	return self:call(
-		'box.dostring',
-		'return true'
-	)
+function M:ping()
+	local res,err = pcall(self.request, self, 65280,'')
+	return res
 end
 
-function box.net.box:ping()
-	-- if self.state ~= 'connected' and self.state ~= 'auto' then return false end
-	return self:request(65280,'')
-end
-
-function box.net.box:call(proc, ...)
+function M:call(proc,...)
 	local cnt = select('#',...)
-	-- local r = 
 	return self:request(22,
 		box.pack('iwaV',
-			0,                      -- flags
+			0, -- flags
 			#proc,
 			proc,
 			cnt,
 			...
 		)
 	)
-	--if r then
-	--	if #r >= 1 then return unpack(r) end
-	--end
-	--if #r == 1 then return r[1]:unpack() end
-	-- return
 end
 
-function box.net.box:ecall(proc,...)
+function M:lua(proc,...)
 		--[[
 			return                        ()                               must be ()
 			return {{}}                   tuple()                          would be ''
@@ -248,8 +151,9 @@ function box.net.box:ecall(proc,...)
 	local t = r[1]:totable()
 	return (unpack( t ))
 end
+M.ecall = M.lua
 
-function box.net.box:delete(space,...)
+function M:delete(space,...)
 	local key_part_count = select('#', ...)
 	local r = self:request(21,
 		box.pack('iiV',
@@ -261,7 +165,7 @@ function box.net.box:delete(space,...)
 	return r
 end
 
-function box.net.box:replace(space, ...)
+function M:replace(space, ...)
 	local field_count = select('#', ...)
 	return self:request(13,
 		box.pack('iiV',
@@ -272,7 +176,7 @@ function box.net.box:replace(space, ...)
 	)
 end
 
-function box.net.box:insert(space, ...)
+function M:insert(space, ...)
 	local field_count = select('#', ...)
 	return self:request(13,
 		box.pack('iiV',
@@ -283,7 +187,7 @@ function box.net.box:insert(space, ...)
 	)
 end
 
-function box.net.box:update(space, key, format, ...)
+function M:update(space, key, format, ...)
 	local op_count = select('#', ...)/2
 	return self:request(19,
 		box.pack('iiVi'..format,
@@ -295,11 +199,11 @@ function box.net.box:update(space, key, format, ...)
 	)
 end
 
-function box.net.box:select( space, index, ...)
+function M:select( space, index, ...)
 	return self:select_limit(space, index, 0, 0xffffffff, ...)
 end
 
-function box.net.box:select_limit(space, index, offset, limit, ...)
+function M:select_limit(space, index, offset, limit, ...)
 	local key_part_count = select('#', ...)
 	return self:request(17,
 		box.pack('iiiiiV',
@@ -313,7 +217,7 @@ function box.net.box:select_limit(space, index, offset, limit, ...)
 	)
 end
 
-function box.net.box:select_range( sno, ino, limit, ...)
+function M:select_range( sno, ino, limit, ...)
 	return self:call(
 		'box.select_range',
 		tostring(sno),
@@ -323,7 +227,7 @@ function box.net.box:select_range( sno, ino, limit, ...)
 	)
 end
 
-function box.net.box:select_reverse_range( sno, ino, limit, ...)
+function M:select_reverse_range( sno, ino, limit, ...)
 	return self:call(
 		'box.select_reverse_range',
 		tostring(sno),
@@ -332,5 +236,3 @@ function box.net.box:select_reverse_range( sno, ino, limit, ...)
 		...
 	)
 end
-
-return box.net.box

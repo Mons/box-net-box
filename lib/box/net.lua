@@ -1,315 +1,375 @@
--- local string = require "string"
--- local debug  = require "debug"
+local oop = require 'box.oop'
+local clr = require 'devel.caller'
 
-local object = require "box.oop"
-local log = require "box.log"
+local NOTCONNECTED = 0;
+local CONNECTING   = 1;
+local CONNECTED    = 2;
+local RECONNECTING = 3;
 
--- local ipc    = box.ipc
--- local fiber  = box.fiber
+local M = oop:define({ __name = 'box.net' })
+box.net = M
 
--- local base = _G
--- log.modlevel(log.DEBUG)
--- module("box.net", package.seeall)
+local S2S = {
+	[NOTCONNECTED]  = 'NOTCONNECTED',
+	[CONNECTING]    = 'CONNECTING',
+	[CONNECTED]     = 'CONNECTED',
+	[RECONNECTING]  = 'RECONNECTING',
+}
+M.S2S = S2S
 
----- test
--- local print    = base.print
--- local tonumber = base.tonumber
--- local tostring = base.tostring
--- local error    = base.error
-
-box.net = object:define({ __name = 'box.net' })
-
--- base.box.net = box.net
-
--- print("net = ",box.net)
-
-function box.net:init( host, port, timeout )
+function M:init(host, port, opt)
 	self.host = host;
-	self.port = tonumber(port);
-	self._timeout = timeout or 1.0;
-	--self.state = 'init'
-	self.state = 'auto'
-	-- states: init, connecting, connected, reconnecting [, resolve ]
-	log.debug("boxinit: %s:%s/%f",self.host,self.port,self._timeout)
-	box.reloader:register(self)
-end
-
-function box.net:destroy()
-	log.info("destroy box.net.box: ", self)
-	box.net.close(self)
-	if self.wrfib then
-		if box.fiber.status(self.wrfib) ~= 'dead' then
-			log.info("Cancel wr:",box.fiber.id(self.wrfib))
-			box.fiber.cancel(self.wrfib)
-		end
-	end
-	if self.rw then
-		if box.fiber.status(self.rw) ~= 'dead' then
-			local fib = box.fiber.id(self.rw)
-			box.info("Cancel rw:",fib)
-			box.fiber.cancel(self.rw)
-		end
-	end
-	self = nil
-	collectgarbage()
-end
-
-function box.net:fdno()
-	local s = tostring(self.s)
-	local x = { string.match(s,"fd%s+(-?%d+)") }
-	if x[1] ~= nil then
-		return tonumber(x[1])
-	else
-		return -1
-	end
-end
-
-function box.net:stringify()
-	return string.format("cnn(%s:%s : %s:%s : %s)",self:fdno(),self.state,self.host,self.port,self.__id)
-end
-
-function box.net:desc()
-	return tostring(self.host) .. ':' .. tostring(self.port) .. '/' .. self:fdno()
-end
-
-function box.net:fatal(message,...)
-	-- print(string.format(message, ...))
-	self.s:close()
-	self.s = nil
-	self.wchan:close()
-end
-
-function box.net:close()
-	-- TODO: correct close in each state
-	if self.s then
-		self.s:close()
-		self.s = nil
-	end
-	if self.wchan then
-		self.wchan:close()
-	end
-end
-
-function box.net:reader()
-	error("Not implemented")
-end
-
-function box.net.writer(self)
-	box.fiber.name("writer."..tostring(self))
-	while self.s do
-		-- print("wait for write data")
-		local wbuf = self.wchan:get()
-		if wbuf then
-			-- printf("got %d bytes to write",#wbuf)
-			local res = { self.s:send(wbuf) }
-			if res[1] ~= string.len(wbuf) then
-				self:fatal("Error while write socket: %s", res[4])
-			end
-		else
-			log.error("no wbuf from wchan")
-		end
-	end
-	return
-end
-
-function box.net.connreader(self)
-	box.fiber.name("rw-cn." .. self:desc())
-	while true do
-		while true do
-			--- printf("connecting to %s:%s", self.host,self.port)
-			self.state = 'connecting'
-			local begin = box.time()
-			self.s = box.socket.tcp() or error("failed to create socket")
-			local status = { self.s:connect( self.host, self.port, self._timeout ) }
-			if status[1] == nil then
-				--- printf("connect to %s:%s failed: %s", self.host, self.port, status[4])
-				self.state = 'reconnecting'
-				if not self.connwait then
-					if self.cchan then
-						self.cchan:put(false)
-						---- print("cchan sent")
-						self.cchan = nil
-					end
-				end
-				box.fiber.sleep(self._timeout - ( box.time() - begin ))
-				self.s = nil
-			else
-				box.fiber.name("rw-cn." .. self:desc())
-				self.state  = 'connected'
-				break;
-			end
-		end
-		
-		self:on_connected()
-		
-		--- print("connected")
-		if self.cchan then
-			self.cchan:put(true)
-			-- print("cchan sent")
-			self.cchan = nil
-		end
-		
-		self.wchan  = box.ipc.channel(1)
-		self.wrfib  = box.fiber.wrap(self.writer,self)
-		box.fiber.testcancel()
-		self:reader()
-		box.fiber.testcancel()
-		
-		print("reader left")
-	end
-end
-
--- connect() | connect(nil) - no wait
--- connect(false) - wait once
--- connect(true) - wait until connected
-
-function box.net:connect(waitready)
-	if self.state ~= 'init' then return end
-	log.debug("called connect in state %s / %s, wait = %s",self.state, self.s, waitready)
-	self.connwait = waitready
+	self.port = tonumber(port)
+	opt = opt or {}
 	
-	if self.connwait ~= nil then
-		self.cchan = box.ipc.channel(1)
+	self.timeout = tonumber(opt.timeout) or 1/3
+	
+	if opt.autoconnect ~= nil then
+		self._auto = opt.autoconnect
+	else
+		self._auto = true
 	end
-	self.rw = box.fiber.wrap(self.connreader,self)
-	if self.connwait == nil then
-		return nil
-	end
-	--- printf("waiting on cchan %s %s",self.cchan, self.connwait and "forever" or "once")
-	local x = self.cchan:get()
-	--- print("got cchan ",x)
-	return x
-end
-
-function box.net:on_connected() end
-
-
-function box.net:timeout(t)
-	local wrapper = {}
-	setmetatable(wrapper,{
-		__index = function(wself, name, ...)
-			local func = self[name]
-			if func then
-				return
-				function(_, ...)
-					self._local_timeout = t
-					return func(self, ...)
-				end
-			end
-			error("Can't find " .. self.__name .. ":" .. name .. " method")
+	
+	if opt.reconnect ~= nil then
+		if opt.reconnect then
+			self._reconnect = tonumber(opt.reconnect)
+		else
+			self._reconnect = false
 		end
-	})
-	return wrapper
+	else
+		self._reconnect = 1/3
+	end
+	
+	self.maxbuf  = 256*1024
+	-- self.maxbuf  = 32
+	
+	self.rbuf = ''
+	self.connwait = setmetatable({},{__mode = "kv"})
+	if opt.deadly or opt.deadly == nil then
+		box.reload:register(self)
+	end
 end
 
-return box.net
+function M:log(l,msg,...)
+	msg = tostring(msg)
+	if string.match(msg,'%%') then
+		msg = string.format(msg,...)
+	else
+		for _,v in pairs({...}) do
+			msg = msg .. ' ' .. tostring(v)
+		end
+	end
+	print(string.format( "[%s] {%s:%s} %s", l, self.host, self.port, msg ))
+end
+
+function M:on_connected()
+	print("default connected callback")
+end
+
+function M:on_disconnect(e)
+	print("default disconnected callback ",e)
+end
 
 --[[
+function M:on_connfail(e)
+	--print("connfail ",e)
+end
+]]
 
-
-function box.con.box:reader()
-	while self.s do
-		local res = { self.s:recv(12) }
-		if res[4] ~= nil then
-			self:fatal("Can't read from %s: %s", self.s, res[3])
-			return
-		end
-		local header = res[1]
-		if string.len(header) ~= 12 then
-			self:fatal("Short read from %s: %s", self.s, res[3] or res[2])
-			return
-		end
-		local op, blen, sync = box.unpack('iii', header)
-		--- print("got header ", op,' ', blen, ' ', sync)
-		local body
-		if blen > 0 then
-			res = { self.s:recv(blen) }
-			if res[4] ~= nil then
-				self:fatal("Can't read from %s: %s", self.s, res[3])
-				return
-			end
-			body = res[1]
-			if string.len(body) ~= blen then
-				self:fatal("Short read from %s: %s", self.s, res[3] or res[2])
-				return
-			end
-		end
-		if self.req[sync] ~= nil then
-			self.req[sync]:put({ op,body })
-		else
-			printf("Unexpected packet %s:%s from %s",op,sync,self.s)
-		end
+function M:_cleanup(e)
+	if self.ww then if self.ww ~= box.fiber.self() then pcall(box.fiber.cancel,self.ww) end self.ww = nil end
+	if self.rw then if self.rw ~= box.fiber.self() then pcall(box.fiber.cancel,self.rw) end self.rw = nil end
+	if self.s  then self.s:close() self.s = nil end
+	self.lasterror = box.errno.strerror(e)
+	for k,v in pairs(self.connwait) do
+		k:put(false)
+		self.connwait[k] = nil
 	end
 end
 
-function box.con.box:ping()
-	-- if self.state ~= 'connected' and self.state ~= 'auto' then return false end
-	return self:request(65280,'')
+function M:destroy()
+	self:_cleanup(0)
+	local name = self.host..':'..self.port
+	for k in pairs(self) do
+		self[k] = nil
+	end
+	setmetatable(self,{
+		__index = function(s,name)
+			print("access to `"..name.."' on destroyed con "..name..clr(1))
+			box.fiber.cancel(box.fiber.self())
+		end,
+		__newindex = function(s,name)
+			print("access to `"..name.."' on destroyed con"..name..clr(1))
+			box.fiber.cancel(box.fiber.self())
+		end
+	})
 end
 
-function box.con.box:call(proc, ...)
-	local cnt = select('#',...)
-	local r = self:request(22,
-		box.pack('iwaV',
-			0,                      -- flags
-			#proc,
-			proc,
-			cnt,
-			...
-		)
-	)
-	if r then
-		if #r >= 1 then return unpack(r) end
+function M:on_connect_failed(e)
+	if self.state == nil or self.state == CONNECTING then
+		self:log('W',"connect failed:",box.errno.strerror(e))
 	end
-	--if #r == 1 then return r[1]:unpack() end
-	return
-end
-
-function box.con.box:request(pktt,body)
-	if self.state == 'auto' then
-		print("autoconnect")
-		self.state = 'init'
-		local connected = self:connect(false)
-		if not connected then return false end
-	end
-	if self.state ~= 'connected' then return false end
-	local sync = box.con.box.seq()
-	local req  = box.pack('iiia', pktt, string.len(body), sync, body)
-	--- printf("state: %s: sending %d bytes...", self.state, #req)
-	self.req[sync] = box.ipc.channel(1)
-	self.wchan:put(req)
-	local res = self.req[sync]:get()
-	---- print("received ",res)
-	if res then
-		local op,body = unpack(res)
-		if op ~= pktt then error("Packet type mismatch") end
-		if op == 65280 then return true end
-		local code,resp = box.unpack('ia',body)
-		if code ~= 0 then box.raise(code, resp) end
-		return { box.unpack('R',resp) }
+	-- TODO: stop all fibers
+	self:_cleanup(e)
+	if self._reconnect then
+		self.state = RECONNECTING
+		if self.on_connfail then
+			box.fiber.wrap(function(self) box.fiber.name("net.cb") self:on_connfail(box.errno.strerror(e)) end,self)
+		end
+		box.fiber.sleep(self._reconnect)
+		self:connect()
 	else
-		error("Not received res")
+		self.state = NOTCONNECTED
+		box.fiber.wrap(function(self) box.fiber.name("net.cb") self:on_disconnect(box.errno.strerror(e)) end,self)
+	end
+end
+
+function M:on_connect_reset(e)
+	self:log('W',"connection reset:",box.errno.strerror(e))
+	-- TODO: stop all fibers
+	self:_cleanup(e)
+	
+	if self._reconnect then
+		self.state = NOTCONNECTED -- was RECONNECTING
+		box.fiber.wrap(function(self) box.fiber.name("net.cb") self:on_disconnect(box.errno.strerror(e)) end,self)
+		box.fiber.sleep(0)
+		self:connect()
+	else
+		self.state = NOTCONNECTED
+		box.fiber.wrap(function(self) box.fiber.name("net.cb") self:on_disconnect(box.errno.strerror(e)) end,self)
+	end
+end
+
+function M:on_read(is_last)
+	print("on_read (last:",is_last,") ",self.rbuf)
+	self.rbuf = ''
+end
+
+function M:on_connect_io()
+	local err = self.s:getsockopt('SOL_SOCKET', 'SO_ERROR');
+	if err ~= 0 then
+		-- TODO: error handling
+		self:on_connect_failed( err )
+		return
+	end
+	self.state = CONNECTED;
+	--print("create reader")
+	
+	local weak = setmetatable({}, { __mode = "kv" })
+	weak.self = self
+	
+	self.rw = box.fiber.wrap(function (weak)
+		box.fiber.name("net.rw")
+		local s = weak.self.s
+		while true do
+			-- TODO: socket destroy
+			local rd = s:readable()
+			
+			collectgarbage()
+			if not weak.self then s:close() return end
+			local self = weak.self
+			
+			if rd then
+				--print("readable ")
+				local rbuf = s:sysread( self.maxbuf - #self.rbuf )
+				if rbuf then
+					--print("received ",#rbuf)
+					self.rbuf = self.rbuf .. rbuf
+					local before = #self.rbuf
+					
+					self:on_read(#rbuf == 0)
+					
+					if #rbuf == 0 then
+						self.rbuf = ''
+						self:on_connect_reset(box.errno.ECONNABORTED)
+						return
+					end
+					
+					if #self.rbuf == before and before == self.maxbuf then
+						self.rbuf = ''
+						self:on_connect_reset(box.errno.ENOMEM)
+						return
+					end
+					
+				else
+					self:on_connect_reset(s:errno())
+					return
+				end
+			else
+				print("Error happens: ",s:error())
+				self:on_connect_reset(s:errno())
+				return
+			end
+		end
+	end,weak)
+	for k,v in pairs(self.connwait) do
+		k:put(true)
+		self.connwait[k] = nil
+	end
+	box.fiber.wrap(function(self) box.fiber.name("net.cb") self:on_connected() end,self)
+end
+
+function M:connect()
+	assert(type(self) == 'table',"object required")
+	
+	if self.state == NOTCONNECTED then
+		self.state = CONNECTING;
+	end
+	-- connect timeout
+	assert(not self.s, "Already have socket")
+	
+	local ai = box.socket.getaddrinfo( self.host, self.port, self.timeout, {
+		['type'] = 'SOCK_STREAM',
+	} )
+	
+	if ai and #ai > 0 then
+		--print(dumper(ai))
+	else
+		self:on_connect_failed( box.errno() == 0 and box.errno.ENXIO or box.errno() )
+		return
+	end
+	
+	local ainfo = ai[1]
+	local s = box.socket( ainfo.family, ainfo.type, ainfo.protocol )
+	if not s then
+		self:on_connect_failed( box.errno() )
+		return
+	end
+	--print("created socket ",s, " ",s:nonblock())
+	s:nonblock(true)
+	s:linger(1,0)
+	
+	while true do
+		if s:sysconnect( ainfo.host, ainfo.port ) then
+			self.s = s
+			-- print("immediate connected")
+			self:on_connect_io()
+			return
+		else
+			if s:errno() == box.errno.EINPROGRESS
+			or s:errno() == box.errno.EALREADY
+			or s:errno() == box.errno.EWOULDBLOCK
+			then
+				self.s = s
+				
+				-- io/w watcher
+				assert(not self.ww, "ww already set")
+				
+				local weak = setmetatable({}, { __mode = "kv" })
+				weak.self = self
+				
+				self.ww = 
+				box.fiber.wrap(function(weak)
+					box.fiber.name("net.cw")
+					local wr = s:writable(weak.self.timeout)
+					collectgarbage()
+					if not weak.self then s:close() return end
+					
+					if wr then
+						weak.self.ww = nil
+						weak.self:on_connect_io()
+						return
+					else
+						weak.self.ww = nil
+						weak.self:on_connect_failed( box.errno.ETIMEDOUT )
+						return
+					end
+				end,weak)
+				return
+			elseif s:errno() == box.errno.EINTR then
+				-- again
+			else
+				self:on_connect_failed( s:errno() )
+				return
+			end
+		end
+	end
+	
+	
+end
+
+function M:write(buf)
+	assert(type(self) == 'table',"object required")
+	
+	if self.state ~= CONNECTED then
+		print("write in state ",S2S[self.state])
+		if self._auto then
+			if self.state == nil then
+				self:connect()
+			end
+		end
+		local connected = false
+		if self.state ~= RECONNECTING then
+			local ch = box.ipc.channel(1)
+			self.connwait[ ch ] = ch
+			connected = ch:get( self.timeout )
+		end
+		if not connected then
+			box.fiber.sleep(0)
+			box.raise(box.error.ER_PROC_LUA, "Not connected for write ("..tostring(self.state)..")")
+		end
+	end
+	if self.wbuf then
+		self.wbuf = self.wbuf .. buf
+		return
+	else
+		--local wr = self.s:syswrite(buf:sub(1,#buf-1))
+		if not self.s then
+			print("Have no socket for write")
+			box.fiber.cancel(box.fiber.self())
+			return
+		end
+		local wr = self.s:syswrite(buf)
+		if wr then
+			--print("written ",wr," bytes of ",#buf)
+			if wr == #buf then
+				--print("written completely")
+				return
+			else
+				--print("written partially")
+				self.wbuf = buf:sub(wr+1)
+				assert(not self.ww, "ww already set")
+				
+				local weak = setmetatable({}, { __mode = "kv" })
+				weak.self = self
+				
+				self.ww = box.fiber.wrap(function (weak)
+					box.fiber.name("net.ww")
+					while true do
+						local wr = self.s:writable(self.timeout)
+						
+						collectgarbage()
+						if not weak.self then s:close() return end
+						local self = weak.self
+						
+						if wr then
+							--print("ww")
+							local wr = self.s:syswrite(self.wbuf)
+							if wr then
+								if wr == #self.wbuf then
+									self.ww = nil
+									self.wbuf = nil
+									return
+								else
+									self.wbuf = self.wbuf:sub(wr+1)
+								end
+							else
+								self:on_connect_reset( self.s:errno() )
+								return
+							end
+						else
+							print("writable failed: ",self.s:error())
+							self:on_connect_reset( box.errno.ETIMEDOUT )
+							return
+						end
+					end
+				end,weak)
+			end
+		else
+			self:on_connect_reset( self.s:errno() )
+		end
 	end
 end
 
 
---local cnn = box.con("127.0.0.1",33013)
-box.fiber.wrap(function()
-	box.fiber.name("main")
-	--box.fiber.detach()
-	local cnn = box.con.box("127.1.0.1",33013)
-	print("new object = ",cnn)
-	-- cnn:connect()
-	-- print("connected:",cnn)
-	while true do
-		--cnn:send("GET / HTTP/1.0\n\n")
-		print("ping: ",cnn:ping())
-		box.fiber.sleep(1)
-		print("call:",cnn:call('testsleep',"0.01"))
-		box.fiber.sleep(1)
-	end
-end)
-
-
-
-]]--
+return M
