@@ -37,17 +37,17 @@ function M:cleanup()
 	print("box.reload.cleanup...")
 	collectgarbage()
 	for ref,cb in pairs(self.O) do
-		cb(ref)
+		box.fiber.wrap(function() cb(ref) end)
 		self.O[ref] = nil
 	end
 	for f in pairs(self.F) do
-		f()
+		box.fiber.wrap(function() f() end)
 		self.F[f] = nil
 	end
 	for t in pairs(self.C) do
 		local cb = t[1]
 		table.remove(t,1)
-		cb(unpack(t))
+		box.fiber.wrap(function() cb(unpack(t)) end )
 		self.C[t] = nil
 	end
 	print("box.reload.cleanup fihished\n\n")

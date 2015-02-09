@@ -63,18 +63,6 @@ function M:destroy()
 			box.fiber.cancel(box.fiber.self())
 		end
 	})
-	--[[
-	self.connected = {
-		rw  = setmetatable({}, {__mode = "kv"}),
-		ro  = setmetatable({}, {__mode = "kv"}),
-		any = setmetatable({}, {__mode = "kv"}),
-	}
-	self.w = {
-		rw  = setmetatable({}, {__mode = "kv"}),
-		ro  = setmetatable({}, {__mode = "kv"}),
-		any = setmetatable({}, {__mode = "kv"}),
-	}
-	]]
 end
 
 function M:connect()

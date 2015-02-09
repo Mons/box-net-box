@@ -162,6 +162,7 @@ function M:on_connect_io()
 		box.fiber.name("net.rw")
 		local s = weak.self.s
 		while true do
+			box.fiber.testcancel()
 			-- TODO: socket destroy
 			local rd = s:readable()
 			
@@ -181,22 +182,26 @@ function M:on_connect_io()
 					
 					if #rbuf == 0 then
 						self.rbuf = ''
+						self.rw = nil
 						self:on_connect_reset(box.errno.ECONNABORTED)
 						return
 					end
 					
 					if #self.rbuf == before and before == self.maxbuf then
 						self.rbuf = ''
+						self.rw = nil
 						self:on_connect_reset(box.errno.ENOMEM)
 						return
 					end
 					
 				else
+					self.rw = nil
 					self:on_connect_reset(s:errno())
 					return
 				end
 			else
 				print("Error happens: ",s:error())
+				self.rw = nil
 				self:on_connect_reset(s:errno())
 				return
 			end
@@ -258,7 +263,7 @@ function M:connect()
 				local weak = setmetatable({}, { __mode = "kv" })
 				weak.self = self
 				
-				self.ww = 
+				self.ww =
 				box.fiber.wrap(function(weak)
 					box.fiber.name("net.cw")
 					local wr = s:writable(weak.self.timeout)
