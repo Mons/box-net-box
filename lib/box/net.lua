@@ -77,14 +77,22 @@ end
 ]]
 
 function M:_cleanup(e)
+	--print('slef.ww')
 	if self.ww then if self.ww ~= box.fiber.self() then pcall(box.fiber.cancel,self.ww) end self.ww = nil end
+	--print('slef.rw ', self.rw)
 	if self.rw then if self.rw ~= box.fiber.self() then pcall(box.fiber.cancel,self.rw) end self.rw = nil end
+	--print('slef.s')
 	if self.s  then self.s:close() self.s = nil end
+	--print('slef.le')
 	self.lasterror = box.errno.strerror(e)
+	--print('slef.cw')
 	for k,v in pairs(self.connwait) do
+		--print('slef.cw put')
 		k:put(false)
+		--print('slef.cw nil')
 		self.connwait[k] = nil
 	end
+	--print('_cleanup')
 end
 
 function M:destroy()
@@ -94,18 +102,29 @@ function M:destroy()
 		self[k] = nil
 	end
 	setmetatable(self,{
-		__index = function(s,name)
-			print("access to `"..name.."' on destroyed con "..name..clr(1))
+		__index = function(s,n)
+			print("access to `"..n.."' on destroyed con "..name..clr(1))
+			--print('index: ', box.fiber.id(box.fiber.self()))
 			box.fiber.cancel(box.fiber.self())
+			--local r,e = pcall(box.fiber.cancel,box.fiber.self())
+			--if not r then
+			--	box.raise(51,"access to `"..n.."' on destroyed con "..name..clr(1))
+			--end
 		end,
-		__newindex = function(s,name)
-			print("access to `"..name.."' on destroyed con"..name..clr(1))
+		__newindex = function(s,n)
+			print("access to `"..n.."' on destroyed con"..name..clr(1))
+			--print('newindex: ', box.fiber.id(box.fiber.self()))
 			box.fiber.cancel(box.fiber.self())
+			--local r,e = pcall(box.fiber.cancel,box.fiber.self())
+			--if not r then
+			--	box.raise(51,"access to `"..n.."' on destroyed con "..name..clr(1))
+			--end
 		end
 	})
 end
 
 function M:on_connect_failed(e)
+	self:log('E','Connect failed:', box.errno.strerror(e))
 	if self.state == nil or self.state == CONNECTING then
 		self:log('W',"connect failed:",box.errno.strerror(e))
 	end
@@ -215,6 +234,7 @@ function M:on_connect_io()
 end
 
 function M:connect()
+	box.fiber.wrap(function()
 	assert(type(self) == 'table',"object required")
 	
 	if self.state == NOTCONNECTED then
@@ -247,7 +267,7 @@ function M:connect()
 	while true do
 		if s:sysconnect( ainfo.host, ainfo.port ) then
 			self.s = s
-			-- print("immediate connected")
+			--print("immediate connected")
 			self:on_connect_io()
 			return
 		else
@@ -290,7 +310,7 @@ function M:connect()
 		end
 	end
 	
-	
+	end)
 end
 
 function M:write(buf)
@@ -341,6 +361,7 @@ function M:write(buf)
 				self.ww = box.fiber.wrap(function (weak)
 					box.fiber.name("net.ww")
 					while true do
+						box.fiber.testcancel()
 						local wr = self.s:writable(self.timeout)
 						
 						collectgarbage()

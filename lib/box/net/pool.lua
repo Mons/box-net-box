@@ -41,25 +41,46 @@ function M:init(list, opts)
 end
 
 function M:destroy()
+	--print('pool:destroy')
 	for c in pairs(self.c) do
+		--print('self.c 1')
 		c:destroy()
+		--print('self.c 2')
 		self.c[c] = nil
+		--print('self.c 3')
 	end
+	--print('self.s 0')
 	for c in pairs(self.f) do
+		--print('self.s 1')
 		pcall(box.fiber.cancel,self.f[c] )
+		--print('self.s 2')
 		self.f[c] = nil
+		--print('self.s 3')
 	end
+	--print('self.w 0')
+	--collectgarbage()
+	for m in pairs(self.w) do
+		--print('self.w 1', m)
+		for c in pairs(self.w[m]) do
+			--print('self.w 2', m)
+			--print(c)
+			c:put(true)
+			--print('self.w 3', m)
+		end
+	end
+	--print('self.name')
 	local name = self.name
 	for k in pairs(self) do
 		self[k] = nil
 	end
+	--print('setmetatable')
 	setmetatable(self,{
-		__index = function(s,name)
-			print("access to `"..name.."' on destroyed pool "..name..clr(1))
+		__index = function(s,n)
+			print("access to `"..n.."' on destroyed pool "..name..clr(1))
 			box.fiber.cancel(box.fiber.self())
 		end,
-		__newindex = function(s,name)
-			print("access to `"..name.."' on destroyed pool "..name..clr(1))
+		__newindex = function(s,n)
+			print("access to `"..n.."' on destroyed pool "..name..clr(1))
 			box.fiber.cancel(box.fiber.self())
 		end
 	})

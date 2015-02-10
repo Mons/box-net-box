@@ -79,9 +79,11 @@ end)
 
 
 local pool = box.net.pool({
-	--{'cld-test.dev.mail.ru', 3013},
+	-- {'cld-test.dev.mail.ru', 3013},
 	-- {'cld-test.dev.mail.ru', 3113},
-	{ '127.10.1.0', 33013 },
+	 { '127.10.1.0', 33013 },
+	-- { '127.0.0.1', 33013 },
+	-- { '127.0.0.1', 3313 }, -- self
 }, { timeout = 1 })
 
 pool:connect()
