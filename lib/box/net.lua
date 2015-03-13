@@ -123,6 +123,17 @@ function M:destroy()
 	})
 end
 
+function M:close()
+	self:_cleanup(0)
+	print(self.host..':'..self.port..' closed')
+--[[
+	if self.s then
+		self.s:close()
+		self.s = nil
+	end
+--]]
+end
+
 function M:on_connect_failed(e)
 	self:log('E','Connect failed:', box.errno.strerror(e))
 	if self.state == nil or self.state == CONNECTING then
