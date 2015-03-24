@@ -61,9 +61,22 @@ function M:log(l,msg,...)
 	end
 	print(string.format( "[%s] {%s:%s} %s", l, self.host, self.port, msg ))
 end
+function box.net:fdno()
+	local s = tostring(self.s)
+	local x = { string.match(s,"fd%s+(-?%d+)") }
+	if x[1] ~= nil then
+		return tonumber(x[1])
+	else
+		return -1
+	end
+end
 
 function box.net:stringify()
 	return string.format("cnn(%s:%s : %s:%s : %s)",self:fdno(),self.state,self.host,self.port,self.__id)
+end
+
+function box.net:desc()
+	return tostring(self.host) .. ':' .. tostring(self.port) .. '/' .. self:fdno()
 end
 
 function M:on_connected()
