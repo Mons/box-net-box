@@ -62,6 +62,10 @@ function M:log(l,msg,...)
 	print(string.format( "[%s] {%s:%s} %s", l, self.host, self.port, msg ))
 end
 
+function box.net:stringify()
+	return string.format("cnn(%s:%s : %s:%s : %s)",self:fdno(),self.state,self.host,self.port,self.__id)
+end
+
 function M:on_connected()
 	print("default connected callback")
 end
