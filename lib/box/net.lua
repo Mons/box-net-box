@@ -1,5 +1,13 @@
 local oop = require 'box.oop'
 local clr = require 'devel.caller'
+local ffi = require 'ffi'
+
+ffi.cdef [[
+	ssize_t read(int fd, void *buf, size_t count);	
+	void *memmove(void *dest, const void *src, size_t n);
+]]
+
+local C = ffi.C
 
 local NOTCONNECTED = 0;
 local CONNECTING   = 1;
@@ -16,6 +24,14 @@ local S2S = {
 	[RECONNECTING]  = 'RECONNECTING',
 }
 M.S2S = S2S
+
+local errno_is_transient = {
+	[box.errno.EINPROGRESS] = true;
+	[box.errno.EAGAIN] = true;
+	[box.errno.EWOULDBLOCK] = true;
+	[box.errno.EINTR] = true;
+}
+
 
 function M:init(host, port, opt)
 	self.host = host;
@@ -40,10 +56,10 @@ function M:init(host, port, opt)
 		self._reconnect = 1/3
 	end
 	
-	self.maxbuf  = 256*1024
-	-- self.maxbuf  = 32
-	
-	self.rbuf = ''
+	self.maxbuf  = 1024*1024
+	self.rbuf = ffi.new('char[?]', self.maxbuf)
+	self.avail = 0ULL
+
 	self.connwait = setmetatable({},{__mode = "kv"})
 	if opt.deadly or opt.deadly == nil then
 		box.reload:register(self)
@@ -188,8 +204,8 @@ function M:on_connect_reset(e)
 end
 
 function M:on_read(is_last)
-	print("on_read (last:",is_last,") ",self.rbuf)
-	self.rbuf = ''
+	print("on_read (last:",is_last,") ",ffi.string(self.rbuf,self.ravail))
+	self.avail = 0ULL
 end
 
 function M:on_connect_io()
@@ -208,47 +224,44 @@ function M:on_connect_io()
 	self.rw = box.fiber.wrap(function (weak)
 		box.fiber.name("net.rw")
 		local s = weak.self.s
+		local oft = 0ULL
+		local sz  = ffi.sizeof(weak.self.rbuf)
 		while true do
-			box.fiber.testcancel()
-			-- TODO: socket destroy
-			local rd = s:readable()
-			
-			collectgarbage()
-			if not weak.self then s:close() return end
+			if not weak.self then return end
 			local self = weak.self
-			
-			if rd then
-				--print("readable ")
-				local rbuf = s:sysread( self.maxbuf - #self.rbuf )
-				if rbuf then
-					--print("received ",#rbuf)
-					self.rbuf = self.rbuf .. rbuf
-					local before = #self.rbuf
-					
-					self:on_read(#rbuf == 0)
-					
-					if #rbuf == 0 then
-						self.rbuf = ''
-						self.rw = nil
-						self:on_connect_reset(box.errno.ECONNABORTED)
-						return
-					end
-					
-					if #self.rbuf == before and before == self.maxbuf then
-						self.rbuf = ''
-						self.rw = nil
+			local rd = C.read(s.socket.fd, self.rbuf + oft, sz - oft)
+			-- local rd = C.read(s.socket.fd, self.rbuf + oft, 13)
+			if rd >= 0 then
+				-- print("read ",rd)
+				self.avail = self.avail + rd;
+				local avail = self.avail
+
+				self:on_read(rd == 0)
+
+				local pkoft = avail - self.avail
+				-- print("avail ",avail, " -> ", self.avail, " pkoft = ", pkoft)
+
+
+				if self.avail > 0 then
+					if rd == 0 then
 						self:on_connect_reset(box.errno.ENOMEM)
 						return
 					end
-					
+					oft = self.avail
+					-- print("avail ",avail, " -> ", self.avail, " pkoft = ", pkoft)
+					C.memmove(self.rbuf,self.rbuf + pkoft,oft)
 				else
-					self.rw = nil
-					self:on_connect_reset(s:errno())
-					return
+					if rd == 0 then
+						self:on_connect_reset(box.errno.ECONNABORTED)
+						return
+					end
+					oft = 0
 				end
+			elseif errno_is_transient[box.errno()] then
+				self = nil
+				s:readable()
 			else
-				print("Error happens: ",s:error())
-				self.rw = nil
+				-- print( box.errno.strerror( box.errno() ))
 				self:on_connect_reset(s:errno())
 				return
 			end

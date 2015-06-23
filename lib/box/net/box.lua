@@ -1,4 +1,16 @@
 local net = require 'box.net'
+local ffi = require 'ffi'
+
+if not pcall(ffi.typeof,"tnt_hdr_t") then
+	ffi.cdef[[
+		typedef struct {
+			uint32_t pkt;
+			uint32_t len;
+			uint32_t seq;
+		} tnt_hdr_t;
+	]]
+end
+
 
 local M = net:inherits({ __name = 'box.net.box' })
 box.net.box = M
@@ -36,42 +48,39 @@ function M:_cleanup(e)
 end
 
 function M:on_read(is_last)
-	-- print("<<", self.rbuf:xd())
-	local oft = 0
-	while #self.rbuf >= oft + 12 do
-		local pktt,len,seq = box.unpack('iii',string.sub(self.rbuf, oft+1,oft+12 ))
-		--print("packet ",pktt," ",len," ",seq)
-		if #self.rbuf >= oft + 12 + len then
-			local body = string.sub( self.rbuf,oft + 12 + 1,oft + 12 + len )
-			--print("body = '",body:xd(),"'")
-			
-			if self.req[ seq ] then
-				if type(self.req[ seq ]) ~= 'number' then
+	local pkoft = 0
+	local avail = self.avail
+	-- print("on_read ",self.avail)
+	while self.avail - pkoft >= 12 do
+		local hdr = ffi.cast('tnt_hdr_t *',self.rbuf + pkoft)
+		if self.avail - pkoft >= 12 + hdr.len then
+			pkoft = pkoft + 12
+			-- print("header ",hdr.pkt, " ", hdr.len, " ", hdr.seq)
+			if self.req[ hdr.seq ] then
+				if type(self.req[ hdr.seq ]) ~= 'number' then
 					--print("Have requestor for ",seq)
-					self.req[ seq ]:put( body )
-					self.req[ seq ] = nil
+					-- if hdr.len > 0 then
+						-- local body = ffi.string( self.rbuf + pkoft, hdr.len )
+						-- print("body = ",body, " len = ",#body, " ", body:xd())
+						self.req[ hdr.seq ]:put( ffi.string( self.rbuf + pkoft, hdr.len ) )
+					-- else
+						-- self.req[ hdr.seq ]:put( '' )
+					-- end
+					self.req[ hdr.seq ] = nil
 				else
 					print("Received timed out ",C2R[ pktt ], "#",seq," after ",string.format( "%0.4fs", box.time() - self.req[ seq ] ))
-					self.req[ seq ] = nil
+					self.req[ hdr.seq ] = nil
 				end
 			else
-				print("Got no requestor for ",seq)
+				print("Got no requestor for ",hdr.seq)
 			end
-			-- ...
-			
-			oft = oft + 12 + len
+			pkoft = pkoft + hdr.len
 		else
 			break
 		end
 	end
-	if oft > 0 then
-		if oft < #self.rbuf then
-			self.rbuf = string.sub( self.rbuf,oft+1 )
-		else
-			self.rbuf = ''
-		end
-	end
-	return
+	-- print("avail = ",avail, " pkoft = ", pkoft)	while true do
+	self.avail = self.avail - pkoft
 end
 
 function M:request(pktt,body)
@@ -87,6 +96,7 @@ function M:request(pktt,body)
 	if body then
 		if #body > 0 then
 			local code,resp = box.unpack('ia',body)
+			-- print("unpacked ",code, " +len",#resp)
 			if code ~= 0 then
 				box.raise(code, resp)
 			end
