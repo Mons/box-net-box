@@ -87,7 +87,7 @@ end
 function M:request(pktt,body)
 	local seq = self.seq()
 	local req = box.pack('iiia', pktt, #body, seq, body)
-	-- print("request ",C2R[pktt] or pktt, "#", seq)
+	print("request ",C2R[pktt] or pktt, "#", seq)
 	self:write(req)
 	local ch = box.ipc.channel(1)
 	self.req[ seq ] = ch
@@ -167,6 +167,7 @@ end
 function M:call(proc,...)
 	local cnt = select('#',...)
 	local seq = self.seq()
+	print("do call ",proc," ",seq," to "..self.host..':'..self.port)
 	local body = box.pack('iwaV',
 		0, -- flags
 		#proc,
@@ -177,7 +178,10 @@ function M:call(proc,...)
 	self:push_write(tnt_hdr_t(22,#body,seq),12)
 	self:push_write(body)
 	self:flush()
-	return self:_waitres(seq)
+	local ret = { self:_waitres(seq) }
+	print("got response for ",seq)
+	return unpack(ret)
+	--return self:_waitres(seq)
 end
 
 function M:lua(proc,...)

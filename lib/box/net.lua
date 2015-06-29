@@ -504,7 +504,7 @@ function M:push_write( buf, len )
 
 	self.wbuf[self.wcur].iov_base = ffibuf
 	self.wbuf[self.wcur].iov_len = len or #buf
-	table.insert(self.wstash,ffibuf)
+	table.insert(self.wstash,buf)
 	self.wcur = self.wcur + 1
 end
 
