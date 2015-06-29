@@ -2,12 +2,27 @@ local oop = require 'box.oop'
 local clr = require 'devel.caller'
 local ffi = require 'ffi'
 
+if not pcall(ffi.typeof,"struct iovec") then
+	ffi.cdef[[
+		struct iovec {
+			void  *iov_base;
+			size_t iov_len;
+		};
+	]]
+end
+
 ffi.cdef [[
+	char *strerror(int errnum);
 	ssize_t read(int fd, void *buf, size_t count);	
+	void *memcpy(void *dest, const void *src, size_t n);
 	void *memmove(void *dest, const void *src, size_t n);
+	ssize_t writev(int fd, const struct iovec *iov, int iovcnt);
 ]]
 
 local C = ffi.C
+
+local iovec = ffi.typeof('struct iovec')
+local IOVSZ = ffi.sizeof(iovec)
 
 local NOTCONNECTED = 0;
 local CONNECTING   = 1;
@@ -59,6 +74,16 @@ function M:init(host, port, opt)
 	self.maxbuf  = 1024*1024
 	self.rbuf = ffi.new('char[?]', self.maxbuf)
 	self.avail = 0ULL
+
+	self.wsize = 32
+	local osz = self.wsize
+	self.wbuf = ffi.new('struct iovec[?]', self.wsize)
+	-- ffi.gc(self.wbuf,function ( ... )
+	-- 	print("gc'ed initial wbuf of size ", osz)
+	-- end)
+
+	self.wcur = 0
+	self.wstash = {}
 
 	self.connwait = setmetatable({},{__mode = "kv"})
 	if opt.deadly or opt.deadly == nil then
@@ -116,9 +141,12 @@ function M:_cleanup(e)
 	if self.rw then if self.rw ~= box.fiber.self() then pcall(box.fiber.cancel,self.rw) end self.rw = nil end
 	--print('slef.s')
 	if self.s  then self.s:close() self.s = nil end
-	--print('slef.le')
+
+	self.wcur   = 0
+	self.wstash = {}
+	self.avail  = 0ULL
+
 	self.lasterror = box.errno.strerror(e)
-	--print('slef.cw')
 	for k,v in pairs(self.connwait) do
 		--print('slef.cw put')
 		k:put(false)
@@ -169,9 +197,6 @@ end
 
 function M:on_connect_failed(e)
 	self:log('E','Connect failed:', box.errno.strerror(e))
-	if self.state == nil or self.state == CONNECTING then
-		self:log('W',"connect failed:",box.errno.strerror(e))
-	end
 	-- TODO: stop all fibers
 	self:_cleanup(e)
 	if self._reconnect then
@@ -326,7 +351,7 @@ function M:connect()
 				
 				self.ww =
 				box.fiber.wrap(function(weak)
-					box.fiber.name("net.cw")
+					box.fiber.name("C."..weak.self.port..'.'..weak.self.host)
 					local wr = s:writable(weak.self.timeout)
 					collectgarbage()
 					if not weak.self then s:close() return end
@@ -354,7 +379,7 @@ function M:connect()
 	end)
 end
 
-function M:write(buf)
+function M:write_(buf)
 	assert(type(self) == 'table',"object required")
 	
 	if self.state ~= CONNECTED then
@@ -438,5 +463,182 @@ function M:write(buf)
 	end
 end
 
+function M:_wbuf_realloc( ... )
+	local old = self.wbuf
+	local osz = self.wsize
+	self.wsize = osz * 2
+	local nsz = self.wsize
+	-- print("realloc from ",osz," to ",self.wsize)
+	self.wbuf = ffi.new('struct iovec[?]', self.wsize)
+	-- ffi.gc(self.wbuf,function ( ... )
+	-- 	print("gc'ed wbuf of size ",nsz)
+	-- end)
+	C.memcpy(self.wbuf, old, self.wcur * ffi.sizeof(self.wbuf[0]))
+end
+
+function M:write( buf )
+	self:push_write(buf)
+	self:flush()
+end
+
+function M:push_write( buf, len )
+	if self.wcur == self.wsize - 1 then
+		self:_wbuf_realloc()
+	end
+
+	local ffibuf
+	if type(buf) == 'cdata' then
+		ffibuf = ffi.cast('char *',buf)
+		-- ffi.gc(ffibuf,function (_)
+		-- 	print("gc'ed wbuf ptr ",_)
+		-- end)
+	else
+		ffibuf = ffi.cast('char *',buf)
+		-- ffibuf = ffi.new('char[?]',len or #buf,buf)
+		-- -- ffi.gc(ffibuf,function (_)
+		-- -- 	print("gc'ed wbuf copy ",_)
+		-- -- end)
+	end
+
+	-- print("push_write ",#buf, "; wcur = ",self.wcur, "; wstash = ", #self.wstash, "; buf = ",ffibuf)
+
+	self.wbuf[self.wcur].iov_base = ffibuf
+	self.wbuf[self.wcur].iov_len = len or #buf
+	table.insert(self.wstash,ffibuf)
+	self.wcur = self.wcur + 1
+end
+
+function M:_writev()
+	--- should return true if no more tries should be done
+
+
+	-- local dbg
+	-- for i = 0,self.wcur-1 do
+	-- 	dbg = ( dbg and ( dbg .. ' + ' ) or '' ) .. tostring(i)..':'..tostring(self.wbuf[i].iov_len)..'->'..tostring(self.wbuf[i].iov_base)
+	-- end
+	-- print(dbg)
+	-- print("call writev(",self.s.socket.fd,") with ",self.wcur, " ",self.wbuf)
+
+	-- local wr = C.writev(self.s.socket.fd, self.wbuf, 1)
+	local wr = C.writev(self.s.socket.fd, self.wbuf, self.wcur)
+
+	-- print("written ", wr)
+	if wr > 0 then
+		-- if true then return end
+		local len = 0
+		for i = 0,self.wcur-1 do
+			len = len + self.wbuf[i].iov_len
+			local cptr = table.remove(self.wstash,1)
+			if len == wr then
+				if i == self.wcur - 1 then
+					-- print("last ", len , " == ", wr)
+					self.wcur = 0
+					return true
+				else
+					-- for z = 1,i+1 do
+					-- 	-- local rm =
+					-- 	table.remove(self.wstash,1)
+					-- 	-- print("removed from stash ",rm)
+					-- end
+					-- print(len , " == ", wr, " / ", i, ' ', self.wcur)
+					self.wcur = self.wcur - (i+1)
+					-- print("(1) new wcur = ",self.wcur, ' new wstash = ', #self.wstash)
+					C.memmove( self.wbuf, self.wbuf[i+1], self.wcur * IOVSZ )
+					return false
+				end
+			elseif len > wr then
+				-- print("len ",len," > ", wr, " wcur = ", self.wcur, " i= ",i)
+
+				local left = len - wr
+				local offset = self.wbuf[i].iov_len - left
+
+				-- for z = 0,i-1 do
+				-- 	print(self.wbuf[z].iov_len, " + ")
+				-- end
+				-- print(offset, " of ", self.wbuf[i].iov_len, " (left ",left, " keep in stash ", self.wstash[1])
+
+				-- why -1 ????
+				-- for z = 1,i-1 do
+				-- 	-- local rm =
+				-- 	table.remove(self.wstash,1)
+				-- 	-- print("removed from stash ",rm)
+				-- end
+
+				table.insert(self.wstash,1,cptr)
+
+				-- local newlen = self.wbuf[i].iov_len - offset
+				-- local newwbuf = ffi.new('char[?]', newlen)
+				-- C.memcpy(newwbuf,ffi.cast('char *',self.wbuf[i].iov_base) + offset, newlen)
+
+				-- print("created new buffer of size ",newlen,": ", newwbuf)
+
+				self.wcur = self.wcur - i -- wcur - (i+1) + 1
+				-- print("(2) new wcur = ",self.wcur, ' new wstash = ', #self.wstash)
+				C.memmove( self.wbuf, self.wbuf[i], self.wcur * IOVSZ )
+
+				self.wbuf[0].iov_base = ffi.cast('char *',ffi.cast('char *',self.wbuf[0].iov_base) + offset)
+				self.wbuf[0].iov_len = left
+				break -- for
+			end
+		end
+	elseif errno_is_transient[ ffi.errno() ] then
+		-- print(box.errno.strerror( ffi.errno() ))
+		-- iowait
+	else
+		print(box.errno.strerror( ffi.errno() ))
+		self:on_connect_reset( ffi.errno() )
+		return true
+	end
+	-- iowait
+	return false
+	
+end
+
+function M:flush()
+	assert(type(self) == 'table',"object required")
+	
+	if self.state ~= CONNECTED then
+		print("flush in state ",S2S[self.state])
+		if self._auto then
+			if self.state == nil then
+				self:connect()
+			end
+		end
+		local connected = false
+		if self.state ~= RECONNECTING then
+			local ch = box.ipc.channel(1)
+			self.connwait[ ch ] = ch
+			connected = ch:get( self.timeout )
+		end
+		if not connected then
+			box.fiber.sleep(0)
+			box.raise(box.error.ER_PROC_LUA, "Not connected for flush ("..tostring(self.state)..")")
+		end
+	end
+
+	if self.flushing then return end
+	self.flushing = true
+	box.fiber.sleep(0)
+
+	if self:_writev() then self.flushing = false return end
+
+	local weak = setmetatable({}, { __mode = "kv" })
+	weak.self = self
+
+	box.fiber.wrap(function(weak)
+		box.fiber.name("W."..weak.self.port..'.'..weak.self.host)
+		local s = weak.self.s
+		local timeout = weak.self.timeout
+		while weak.self do
+			if s:writable() then
+				if not weak.self then break end
+				if weak.self:_writev() then break end
+			end
+		end
+		if weak.self then
+			weak.self.flushing = false
+		end
+	end,weak)		
+end
 
 return M

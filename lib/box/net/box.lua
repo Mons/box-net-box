@@ -10,7 +10,7 @@ if not pcall(ffi.typeof,"tnt_hdr_t") then
 		} tnt_hdr_t;
 	]]
 end
-
+local tnt_hdr_t = ffi.typeof('tnt_hdr_t')
 
 local M = net:inherits({ __name = 'box.net.box' })
 box.net.box = M
@@ -62,7 +62,8 @@ function M:on_read(is_last)
 					-- if hdr.len > 0 then
 						-- local body = ffi.string( self.rbuf + pkoft, hdr.len )
 						-- print("body = ",body, " len = ",#body, " ", body:xd())
-						self.req[ hdr.seq ]:put( ffi.string( self.rbuf + pkoft, hdr.len ) )
+						-- self.req[ hdr.seq ]:put( ffi.string( self.rbuf + pkoft, hdr.len ) )
+						self.req[ hdr.seq ]:put( { ffi.cast( 'char *', self.rbuf + pkoft ), hdr.len } )
 					-- else
 						-- self.req[ hdr.seq ]:put( '' )
 					-- end
@@ -94,8 +95,8 @@ function M:request(pktt,body)
 	local body = ch:get( self.timeout ) -- timeout?
 	--print("got body = ",body, " ",self.lasterror)
 	if body then
-		if #body > 0 then
-			local code,resp = box.unpack('ia',body)
+		if body[2] > 0 then
+			local code,resp = box.unpack('ia',ffi.string( body[1],body[2] ))
 			-- print("unpacked ",code, " +len",#resp)
 			if code ~= 0 then
 				box.raise(code, resp)
@@ -115,12 +116,42 @@ function M:request(pktt,body)
 	end
 end
 
+function M:_waitres( seq )
+	local ch = box.ipc.channel(1)
+	self.req[ seq ] = ch
+	local now = box.time()
+	local body = ch:get( self.timeout ) -- timeout?
+	--print("got body = ",body, " ",self.lasterror)
+	if body then
+		if body[2] > 0 then
+			local code = ffi.cast('uint32_t *',body[1])[0]
+			if code == 0 then
+				return box.unpack('R',ffi.string( body[1]+4,body[2]-4 ))
+			else
+				box.raise(tonumber(code), ffi.string( body[1]+4,body[2]-4 ))
+			end
+		else
+			return ''
+		end
+	elseif body == false then
+		self.req[ seq ] = nil
+		print("Request #",seq," error: "..self.lasterror.." after ",string.format( "%0.4fs", box.time() - now ))
+		box.raise( box.error.ER_PROC_LUA, "Request #"..seq.." error: "..self.lasterror )
+	else
+		self.req[ seq ] = now
+		print("Request #",seq," timed out after ",string.format( "%0.4fs", box.time() - now ))
+		box.raise( box.error.ER_PROC_LUA, "Request #"..seq.." timed out" )
+	end
+
+	-- body
+end
+
 function M:ping()
 	local res,err = pcall(self.request, self, 65280,'')
 	return res
 end
 
-function M:call(proc,...)
+function M:call_old ( proc,... )
 	local cnt = select('#',...)
 	return self:request(22,
 		box.pack('iwaV',
@@ -131,6 +162,22 @@ function M:call(proc,...)
 			...
 		)
 	)
+end
+
+function M:call(proc,...)
+	local cnt = select('#',...)
+	local seq = self.seq()
+	local body = box.pack('iwaV',
+		0, -- flags
+		#proc,
+		proc,
+		cnt,
+		...
+	)
+	self:push_write(tnt_hdr_t(22,#body,seq),12)
+	self:push_write(body)
+	self:flush()
+	return self:_waitres(seq)
 end
 
 function M:lua(proc,...)
