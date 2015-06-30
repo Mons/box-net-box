@@ -12,7 +12,7 @@ if not pcall(ffi.typeof,"tnt_hdr_t") then
 end
 local tnt_hdr_t = ffi.typeof('tnt_hdr_t')
 
-local M = net:inherits({ __name = 'box.net.box' })
+local M = net:inherits({ __name = 'box.net.box', debug = {} })
 box.net.box = M
 
 require 'box.net.self'
@@ -47,15 +47,31 @@ function M:_cleanup(e)
 	end
 end
 
+function M:_buffer_state()
+	if self.avail >= 12 then
+		local hdr = ffi.cast('tnt_hdr_t *',self.rbuf)
+		print("[I] BUF[", self.avail, ']: ', C2R[hdr.pkt],'#',hdr.seq,' + ', ( tonumber(self.avail) - 12 ), ' of ' , hdr.len)
+	elseif self.avail >= 8 then
+		local hdr = ffi.cast('tnt_hdr_t *',self.rbuf)
+		print("[I] BUF[", self.avail, ']: ', C2R[hdr.pkt],'#? + ',tonumber(self.avail) - 12, ' of ' , hdr.len)
+	elseif self.avail >= 4 then
+		local hdr = ffi.cast('tnt_hdr_t *',self.rbuf)
+		print("[I] BUF[", self.avail, ']: ', C2R[hdr.pkt],'#? + ?')
+	else
+		print("[I] BUF[", self.avail,']')
+	end
+end
+
 function M:on_read(is_last)
 	local pkoft = 0
 	local avail = self.avail
 	-- print("on_read ",self.avail)
+	if M.debug.rbuf then self:_buffer_state() end
 	while self.avail - pkoft >= 12 do
 		local hdr = ffi.cast('tnt_hdr_t *',self.rbuf + pkoft)
 		if self.avail - pkoft >= 12 + hdr.len then
 			pkoft = pkoft + 12
-			-- print("header ",hdr.pkt, " ", hdr.len, " ", hdr.seq)
+			if M.debug.pkt then print("[I] PKT ",C2R[hdr.pkt],'#',hdr.seq,' + ',hdr.len) end
 			if self.req[ hdr.seq ] then
 				if type(self.req[ hdr.seq ]) ~= 'number' then
 					--print("Have requestor for ",seq)
@@ -63,13 +79,28 @@ function M:on_read(is_last)
 						-- local body = ffi.string( self.rbuf + pkoft, hdr.len )
 						-- print("body = ",body, " len = ",#body, " ", body:xd())
 						-- self.req[ hdr.seq ]:put( ffi.string( self.rbuf + pkoft, hdr.len ) )
-						self.req[ hdr.seq ]:put( { ffi.cast( 'char *', self.rbuf + pkoft ), hdr.len } )
+
+						-- self.req[ hdr.seq ]:put( { ffi.cast( 'char *', self.rbuf + pkoft ), hdr.len } )
+
+						local res
+						if hdr.len >= 4 then
+							local code = ffi.cast('uint32_t *', self.rbuf + pkoft )[0]
+							if code == 0 then
+								res = { 0, { box.unpack('R', ffi.string( self.rbuf + pkoft + 4, hdr.len-4 )) } }
+							else
+								res = { tonumber(code), ffi.string( self.rbuf + pkoft + 4, hdr.len-4 ) }
+							end
+						else
+							res = { 0, {''} }
+						end
+						self.req[ hdr.seq ]:put(res)
+
 					-- else
 						-- self.req[ hdr.seq ]:put( '' )
 					-- end
 					self.req[ hdr.seq ] = nil
 				else
-					print("Received timed out ",C2R[ pktt ], "#",seq," after ",string.format( "%0.4fs", box.time() - self.req[ seq ] ))
+					print("Received timed out ",C2R[ hdr.pkt ], "#",seq," after ",string.format( "%0.4fs", box.time() - self.req[ seq ] ))
 					self.req[ hdr.seq ] = nil
 				end
 			else
@@ -77,6 +108,10 @@ function M:on_read(is_last)
 			end
 			pkoft = pkoft + hdr.len
 		else
+			if hdr.len + 12 > self.maxbuf then
+				self:_buffer_state()
+				print("[E] Received too big packet ",C2R[hdr.pkt],'#',hdr.seq,' + ', hdr.len,". Max avail: ",self.maxbuf)
+			end
 			break
 		end
 	end
@@ -95,15 +130,10 @@ function M:request(pktt,body)
 	local body = ch:get( self.timeout ) -- timeout?
 	--print("got body = ",body, " ",self.lasterror)
 	if body then
-		if body[2] > 0 then
-			local code,resp = box.unpack('ia',ffi.string( body[1],body[2] ))
-			-- print("unpacked ",code, " +len",#resp)
-			if code ~= 0 then
-				box.raise(code, resp)
-			end
-			return box.unpack('R',resp)
+		if body[1] == 0 then
+			return unpack(body[2])
 		else
-			return ''
+			box.raise(body[1], body[2])
 		end
 	elseif body == false then
 		self.req[ seq ] = nil
@@ -123,16 +153,21 @@ function M:_waitres( seq )
 	local body = ch:get( self.timeout ) -- timeout?
 	--print("got body = ",body, " ",self.lasterror)
 	if body then
-		if body[2] > 0 then
-			local code = ffi.cast('uint32_t *',body[1])[0]
-			if code == 0 then
-				return box.unpack('R',ffi.string( body[1]+4,body[2]-4 ))
-			else
-				box.raise(tonumber(code), ffi.string( body[1]+4,body[2]-4 ))
-			end
+		if body[1] == 0 then
+			return unpack(body[2])
 		else
-			return ''
+			box.raise(body[1], body[2])
 		end
+		-- if body[2] > 0 then
+		-- 	local code = ffi.cast('uint32_t *',body[1])[0]
+		-- 	if code == 0 then
+		-- 		return box.unpack('R',ffi.string( body[1]+4,body[2]-4 ))
+		-- 	else
+		-- 		box.raise(tonumber(code), ffi.string( body[1]+4,body[2]-4 ))
+		-- 	end
+		-- else
+		-- 	return ''
+		-- end
 	elseif body == false then
 		self.req[ seq ] = nil
 		print("Request #",seq," error: "..self.lasterror.." after ",string.format( "%0.4fs", box.time() - now ))

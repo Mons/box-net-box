@@ -71,7 +71,7 @@ function M:init(host, port, opt)
 		self._reconnect = 1/3
 	end
 	
-	self.maxbuf  = 1024*1024
+	self.maxbuf  = 2*1024*1024
 	self.rbuf = ffi.new('char[?]', self.maxbuf)
 	self.avail = 0ULL
 
@@ -255,7 +255,7 @@ function M:on_connect_io()
 			if not weak.self then return end
 			local self = weak.self
 			local rd = C.read(s.socket.fd, self.rbuf + oft, sz - oft)
-			-- local rd = C.read(s.socket.fd, self.rbuf + oft, 13)
+			-- local rd = C.read(s.socket.fd, self.rbuf + oft, 1)
 			if rd >= 0 then
 				-- print("read ",rd)
 				self.avail = self.avail + rd;
@@ -268,8 +268,8 @@ function M:on_connect_io()
 
 
 				if self.avail > 0 then
-					if rd == 0 then
-						self:on_connect_reset(box.errno.ENOMEM)
+					if self.avail == self.maxbuf then
+						self:on_connect_reset(box.errno.EMSGSIZE)
 						return
 					end
 					oft = self.avail
